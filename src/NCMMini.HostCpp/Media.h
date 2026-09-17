@@ -15,16 +15,22 @@ struct LyricLine
     std::wstring text;
 };
 
+// Known cache locations, including absent directories that may appear after player startup.
+std::vector<std::filesystem::path> MediaCacheDirectories(
+    const std::filesystem::path& localAppData = LocalAppDataPath());
+
 class TrackCatalog
 {
 public:
+    explicit TrackCatalog(std::vector<std::filesystem::path> dataDirectories = MediaCacheDirectories());
+
     TrackInfo Find(const std::wstring& title, bool forceReload = false);
     TrackInfo FindQueued(const std::wstring& title) const;
 
 private:
     void EnsureLoaded(bool forceReload);
 
-    std::filesystem::path dataDirectory_ = std::filesystem::path(LocalAppDataPath()) / L"NetEase" / L"CloudMusic" / L"webdata" / L"file";
+    std::vector<std::filesystem::path> dataDirectories_;
     std::chrono::steady_clock::time_point lastLoad_{};
     std::vector<TrackInfo> tracks_;
 };
@@ -32,13 +38,16 @@ private:
 class LyricsStore
 {
 public:
+    explicit LyricsStore(std::vector<std::filesystem::path> dataDirectories = MediaCacheDirectories());
+
     std::vector<LyricLine> Find(const TrackInfo& track) const;
     static std::vector<LyricLine> Parse(const std::string& text);
     static std::wstring Current(const std::vector<LyricLine>& lines, std::chrono::milliseconds elapsed);
 
 private:
-    std::filesystem::path dataDirectory_ = std::filesystem::path(LocalAppDataPath()) / L"NetEase" / L"CloudMusic" / L"webdata" / L"file";
+    std::vector<std::filesystem::path> dataDirectories_;
 };
 
-std::vector<std::uint8_t> LoadCover(const std::wstring& url);
+// Native cache is tried first. Disabling downloads still permits an offline cache hit.
+std::vector<std::uint8_t> LoadCover(const std::wstring& url, bool allowDownload = true);
 }

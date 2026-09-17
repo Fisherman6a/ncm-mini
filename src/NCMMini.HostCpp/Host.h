@@ -1,7 +1,14 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#define _WIN32_WINNT 0x0601
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include <windows.h>
 
@@ -12,6 +19,9 @@
 
 namespace ncmmini
 {
+enum class TaskbarMode { Auto, Win11, DeskBand };
+enum class PlaybackState { Unknown, Playing, Paused };
+
 struct AppOptions
 {
     std::wstring cloudMusicPath;
@@ -19,6 +29,11 @@ struct AppOptions
     bool closeCloudMusicOnExit = true;
     bool showLyrics = true;
     bool showBand = true;
+    bool downloadCover = true;
+    TaskbarMode taskbarMode = TaskbarMode::Auto;
+    unsigned int durationSeconds = 0;
+    bool taskbarStatus = false;
+    std::wstring error;
 };
 
 struct TrackInfo
@@ -37,6 +52,7 @@ struct PlayerSnapshot
     HWND mainWindow = nullptr;
     std::wstring windowTitle;
     TrackInfo track;
+    PlaybackState playback = PlaybackState::Unknown;
 };
 
 struct BandState
@@ -46,6 +62,7 @@ struct BandState
     std::wstring artist;
     std::wstring lyric;
     std::vector<std::uint8_t> cover;
+    PlaybackState playback = PlaybackState::Unknown;
 };
 
 enum class BandCommand : std::uint32_t
@@ -58,6 +75,7 @@ enum class BandCommand : std::uint32_t
 };
 
 AppOptions ParseOptions(int argumentCount, wchar_t** arguments);
+TaskbarMode SelectTaskbarMode(TaskbarMode requested, DWORD build, bool modernTaskbar);
 std::wstring Utf8ToWide(const std::string& text);
 std::string WideToUtf8(const std::wstring& text);
 std::wstring Trim(std::wstring text);
@@ -73,7 +91,7 @@ public:
     explicit PlayerController(AppOptions options);
 
     bool TryLaunch();
-    PlayerSnapshot ReadSnapshot() const;
+    PlayerSnapshot ReadSnapshot(bool includePlayback = false) const;
     bool Send(BandCommand command, DWORD processId) const;
     void Close();
 

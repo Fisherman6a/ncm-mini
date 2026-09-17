@@ -1,4 +1,5 @@
 #include "Host.h"
+#include "PlaybackAccessibility.h"
 
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -141,6 +142,27 @@ AppOptions ParseOptions(int argumentCount, wchar_t** arguments)
         {
             options.showBand = false;
         }
+        else if (argument == L"--taskbar")
+        {
+            if (++index >= argumentCount) { options.error = L"Missing --taskbar mode"; break; }
+            const std::wstring mode = arguments[index];
+            if (mode == L"auto") options.taskbarMode = TaskbarMode::Auto;
+            else if (mode == L"win11") options.taskbarMode = TaskbarMode::Win11;
+            else if (mode == L"deskband") options.taskbarMode = TaskbarMode::DeskBand;
+            else options.error = L"Expected --taskbar auto|win11|deskband";
+        }
+        else if (argument == L"--duration")
+        {
+            if (++index >= argumentCount) { options.error = L"Missing --duration seconds"; break; }
+            wchar_t* end = nullptr;
+            const auto seconds = wcstol(arguments[index], &end, 10);
+            if (end == arguments[index] || *end || seconds < 1 || seconds > 3600)
+                options.error = L"Expected --duration 1..3600";
+            else options.durationSeconds = static_cast<unsigned int>(seconds);
+        }
+        else if (argument == L"--taskbar-status") options.taskbarStatus = true;
+        else if (argument == L"--no-cover-download") options.downloadCover = false;
+        else options.error = L"Unknown or incomplete argument: " + argument;
     }
     return options;
 }
@@ -295,7 +317,7 @@ bool PlayerController::TryLaunch()
     return true;
 }
 
-PlayerSnapshot PlayerController::ReadSnapshot() const
+PlayerSnapshot PlayerController::ReadSnapshot(bool includePlayback) const
 {
     const auto processIds = CloudMusicProcessIds();
     if (processIds.empty())
@@ -360,6 +382,7 @@ PlayerSnapshot PlayerController::ReadSnapshot() const
     const auto [name, artist] = ParsePlayerTitle(snapshot.windowTitle);
     snapshot.track.name = name;
     snapshot.track.artist = artist;
+    if (includePlayback) snapshot.playback = ReadAccessiblePlayback(snapshot.mainWindow, snapshot.processId);
     return snapshot;
 }
 
@@ -387,8 +410,8 @@ bool PlayerController::Send(BandCommand command, DWORD processId) const
         return false;
     }
     const WPARAM parameter = MAKELONG(static_cast<WORD>(slot), static_cast<WORD>(CloudMusicCommandCode));
-    DWORD_PTR result = 0;
-    return SendMessageTimeoutW(target, WM_COMMAND, parameter, 0, SMTO_ABORTIFHUNG, 1000, &result) != 0;
+    // Success means queued, not that the player changed state. Readback is separate.
+    return PostMessageW(target, WM_COMMAND, parameter, 0) != FALSE;
 }
 
 void PlayerController::Close()
