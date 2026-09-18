@@ -1,6 +1,8 @@
 #include "PlaybackAccessibility.h"
 #include <wrl/client.h>
 #include <deque>
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace ncmmini
@@ -11,6 +13,80 @@ using Microsoft::WRL::ComPtr;
 constexpr long MaximumChildren = 64;
 constexpr unsigned MaximumNodes = 256;
 constexpr unsigned MaximumDepth = 16;
+constexpr unsigned MaximumRenderers = 4;
+constexpr unsigned MaximumDetachedHosts = 32;
+constexpr ULONGLONG RefreshIntervalMs = 500;
+constexpr ULONGLONG RecoveryIntervalMs = 2000;
+
+void RequestPageTree(HWND window, IAccessible* root)
+{
+    // Chromium's WindowsAccessibilityEnabler requires both accName and its
+    // WM_GETOBJECT honey-pot (object id 1) before enabling basic web contents.
+    // OBJID_CLIENT alone can expose an empty document indefinitely.
+    VARIANT self{}; self.vt = VT_I4; self.lVal = CHILDID_SELF;
+    BSTR name = nullptr;
+    root->get_accName(self, &name);
+    SysFreeString(name);
+    DWORD_PTR reply = 0;
+    SendMessageTimeoutW(window, WM_GETOBJECT, 0, 1,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &reply);
+    // A zero reply is normal; only a later, complete button group proves recovery.
+}
+
+bool RequestPageUpdate(IAccessible* root)
+{
+    VARIANT self{}; self.vt = VT_I4; self.lVal = CHILDID_SELF;
+    long left = 0, top = 0, width = 0, height = 0;
+    if (root->accLocation(&left, &top, &width, &height, self) != S_OK || width <= 0 || height <= 0)
+        return false;
+    const auto x = static_cast<std::int64_t>(left) + width / 2;
+    const auto y = static_cast<std::int64_t>(top) + height / 2;
+    if (x > std::numeric_limits<long>::max() || y > std::numeric_limits<long>::max()) return false;
+    // Chromium sends this read-only hit test to the renderer, refreshing its cached
+    // accessibility tree even while minimized. The response may arrive on a later poll.
+    VARIANT hit{};
+    const auto hr = root->accHitTest(static_cast<long>(x), static_cast<long>(y), &hit);
+    const bool requested = hr == S_OK && (hit.vt == VT_I4 || (hit.vt == VT_DISPATCH && hit.pdispVal));
+    VariantClear(&hit);
+    return requested;
+}
+
+struct RendererSearch
+{
+    DWORD pid;
+    std::vector<HWND> windows;
+    unsigned detachedHosts = 0;
+    bool overflow = false;
+};
+
+BOOL CALLBACK CollectRenderer(HWND window, LPARAM data)
+{
+    auto& search = *reinterpret_cast<RendererSearch*>(data);
+    DWORD owner = 0;
+    GetWindowThreadProcessId(window, &owner);
+    if (owner != search.pid) return TRUE;
+    wchar_t name[128]{};
+    GetClassNameW(window, name, 128);
+    if (std::wstring(name) != L"Chrome_RenderWidgetHostHWND") return TRUE;
+    if (std::find(search.windows.begin(), search.windows.end(), window) != search.windows.end()) return TRUE;
+    if (search.windows.size() >= MaximumRenderers) { search.overflow = true; return FALSE; }
+    search.windows.push_back(window);
+    return TRUE;
+}
+
+BOOL CALLBACK CollectDetachedRenderer(HWND window, LPARAM data)
+{
+    auto& search = *reinterpret_cast<RendererSearch*>(data);
+    DWORD owner = 0;
+    GetWindowThreadProcessId(window, &owner);
+    if (owner != search.pid) return TRUE;
+    wchar_t name[128]{};
+    GetClassNameW(window, name, 128);
+    if (std::wstring(name) != L"Chrome_WidgetWin_0") return TRUE;
+    if (++search.detachedHosts > MaximumDetachedHosts) { search.overflow = true; return FALSE; }
+    EnumChildWindows(window, CollectRenderer, data);
+    return !search.overflow;
+}
 
 struct Element
 {
@@ -143,27 +219,88 @@ PlaybackState ReadAccessiblePlayback(HWND playerWindow, DWORD processId)
     if (!playerWindow || !processId || !IsWindow(playerWindow)
         || !GetWindowThreadProcessId(playerWindow, &owner) || owner != processId || IsHungAppWindow(playerWindow))
         return PlaybackState::Unknown;
-    struct Search { DWORD pid; std::vector<HWND> windows; } search{processId, {}};
-    EnumChildWindows(playerWindow, [](HWND window, LPARAM data) -> BOOL {
-        auto& search = *reinterpret_cast<Search*>(data);
-        wchar_t name[128]{}; DWORD owner = 0;
-        GetWindowThreadProcessId(window, &owner);
-        GetClassNameW(window, name, 128);
-        if (owner == search.pid && std::wstring(name) == L"Chrome_RenderWidgetHostHWND") search.windows.push_back(window);
-        return search.windows.size() < 4;
-    }, reinterpret_cast<LPARAM>(&search));
+    RendererSearch search{processId, {}};
+    EnumChildWindows(playerWindow, CollectRenderer, reinterpret_cast<LPARAM>(&search));
+    const bool minimized = IsIconic(playerWindow) != FALSE;
+    if (minimized)
+    {
+        // NetEase reparents its renderer to a separate CEF host while minimized.
+        // Keep attached renderers too: a minimized page can temporarily have both
+        // parent arrangements during a renderer transition.
+        EnumWindows(CollectDetachedRenderer, reinterpret_cast<LPARAM>(&search));
+    }
+    if (search.overflow) return PlaybackState::Unknown;
     // Store only indices, never COM interfaces that could outlive the caller's apartment.
-    struct Hint { HWND window = nullptr; DWORD pid = 0; std::vector<long> path; };
-    static thread_local Hint hint;
+    struct Hint
+    {
+        HWND window;
+        std::vector<long> path;
+        ULONGLONG nextRefresh = 0;
+        bool refreshRequested = false;
+        ULONGLONG nextRecovery = 0;
+    };
+    struct Cache { HWND player = nullptr; DWORD pid = 0; bool minimized = false; std::vector<Hint> hints; };
+    static thread_local Cache cache;
+    if (cache.player != playerWindow || cache.pid != processId || cache.minimized != minimized)
+        cache = {playerWindow, processId, minimized, {}};
+    cache.hints.erase(std::remove_if(cache.hints.begin(), cache.hints.end(), [&](const Hint& hint) {
+        return std::find(search.windows.begin(), search.windows.end(), hint.window) == search.windows.end();
+    }), cache.hints.end());
+    PlaybackState result = PlaybackState::Unknown;
+    unsigned matches = 0;
+    bool unresolved = false;
     for (const auto window : search.windows)
     {
-        if (hint.window != window || hint.pid != processId) hint = {window, processId, {}};
+        auto found = std::find_if(cache.hints.begin(), cache.hints.end(),
+            [window](const Hint& hint) { return hint.window == window; });
+        if (found == cache.hints.end())
+        {
+            cache.hints.push_back({window, {}});
+            found = cache.hints.end() - 1;
+        }
+        auto& hint = *found;
         ComPtr<IAccessible> root;
-        if (FAILED(AccessibleObjectFromWindow(window, OBJID_CLIENT, IID_IAccessible,
-            reinterpret_cast<void**>(root.GetAddressOf())))) { hint.path.clear(); continue; }
+        const auto accessible = AccessibleObjectFromWindow(window, OBJID_CLIENT, IID_IAccessible,
+            reinterpret_cast<void**>(root.GetAddressOf()));
+        if (FAILED(accessible) || !root)
+        {
+            hint.path.clear(); hint.nextRefresh = 0; hint.refreshRequested = false;
+            unresolved = minimized;
+            continue;
+        }
+        long childCount = 0;
+        if (FAILED(root->get_accChildCount(&childCount)) || childCount <= 0)
+        {
+            hint.path.clear(); hint.nextRefresh = 0; hint.refreshRequested = false;
+            if (GetTickCount64() >= hint.nextRecovery)
+            {
+                RequestPageTree(window, root.Get());
+                hint.nextRecovery = GetTickCount64() + RecoveryIntervalMs;
+            }
+            unresolved = true;
+            continue;
+        }
+        if (minimized)
+        {
+            if (GetTickCount64() >= hint.nextRefresh)
+            {
+                hint.refreshRequested = RequestPageUpdate(root.Get());
+                hint.nextRefresh = GetTickCount64() + RefreshIntervalMs;
+            }
+            if (!hint.refreshRequested) { hint.path.clear(); unresolved = true; continue; }
+        }
         const auto state = ReadPlaybackControls(root.Get(), hint.path);
-        if (state != PlaybackState::Unknown) return state;
+        if (state != PlaybackState::Unknown)
+        {
+            if (!minimized) return state;
+            result = state;
+            ++matches;
+        }
+        else if (minimized)
+        {
+            unresolved = true;
+        }
     }
-    return PlaybackState::Unknown;
+    return !unresolved && matches == 1 ? result : PlaybackState::Unknown;
 }
 }
